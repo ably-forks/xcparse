@@ -202,7 +202,7 @@ class XCPParser {
         }
 
         // This is going to be the mapping of the places we're going to export the screenshots to
-        var exportURLsToAttachments: [String : [ActionTestAttachment]] = [:]
+        var exportURLsToAttachments: [String : [AttachmentForExport]] = [:]
 
         let actions = invocationRecord.actions.filter { $0.actionResult.testsRef != nil }
         for action in actions {
@@ -242,7 +242,7 @@ class XCPParser {
                         if options.testSummaryFilter(testSummary) == false {
                             continue
                         }
-
+                        
                         let filteredChildActivities = childActivitySummaries.filter(options.activitySummaryFilter)
                         let filteredAttachments = filteredChildActivities.flatMap { $0.attachments.filter(options.attachmentFilter) }
 
@@ -254,7 +254,7 @@ class XCPParser {
                         // Now that we know what we want to export, save it to the dictionary so we can have all the exports
                         // done at once with one progress bar per URL
                         var existingAttachmentsForURL = exportURLsToAttachments[testSummaryScreenshotURL.path] ?? []
-                        existingAttachmentsForURL.append(contentsOf: filteredAttachments)
+                        existingAttachmentsForURL.append(contentsOf: filteredAttachments.map { .init(attachment: $0, testSummary: testSummary)})
                         exportURLsToAttachments[testSummaryScreenshotURL.path] = existingAttachmentsForURL
                     }
 
@@ -274,9 +274,55 @@ class XCPParser {
 
             self.exportAttachments(withXCResult: xcresult, toDirectory: exportURL, attachments: attachmentsToExport, displayName: displayName)
         }
+        
+        try exportAttachmentDescriptors(for: exportURLsToAttachments.flatMap(\.value), toDirectory: Foundation.URL(fileURLWithPath: destination))
     }
-
-    func exportAttachments(withXCResult xcresult: XCResult, toDirectory screenshotDirectoryURL: Foundation.URL, attachments: [ActionTestAttachment], displayName: String = "") {
+    
+    struct AttachmentForExport {
+        var attachment: ActionTestAttachment
+        // We'll get the test name from identifier on this
+        var testSummary: ActionTestSummary
+        
+        enum Error: Swift.Error {
+            case attachmentFilenameIsNil
+            case testSummaryIdentifierIsNil
+            case testSummaryIdentifierUnexpectedFormat
+        }
+        
+        func testName() throws -> (testClassName: String, testCaseName: String) {
+            // testSummary.identifier looks like e.g.
+            // RealtimeClientPresenceTests/test__032__Presence__enter__entering_without_an_explicit_PresenceMessage_clientId_should_implicitly_use_the_clientId_of_the_current_connection()
+            
+            guard let testSummaryIdentifier = testSummary.identifier else {
+                throw Error.testSummaryIdentifierIsNil
+            }
+            
+            // We preserve the () in the test case name, to be consistent with the behaviour of Fastlane's JUnit report generation.
+            let regex = try NSRegularExpression(pattern: "(.*)/(.*)")
+            guard let result = regex.firstMatch(in: testSummaryIdentifier, range: NSRange(location: 0, length: testSummaryIdentifier.count)) else {
+                throw Error.testSummaryIdentifierUnexpectedFormat
+            }
+            return (testClassName: (testSummaryIdentifier as NSString).substring(with: result.range(at: 1)), testCaseName: (testSummaryIdentifier as NSString).substring(with:result.range(at: 2)))
+        }
+        
+        func descriptor() throws -> Descriptor {
+            let testName = try self.testName()
+            
+            guard let attachmentName = attachment.filename else {
+                throw Error.attachmentFilenameIsNil
+            }
+            
+            return Descriptor(testClassName: testName.testClassName, testCaseName: testName.testCaseName, attachmentName: attachmentName)
+        }
+    
+        struct Descriptor: Codable {
+            var testClassName: String
+            var testCaseName: String
+            var attachmentName: String
+        }
+    }
+    
+    func exportAttachments(withXCResult xcresult: XCResult, toDirectory screenshotDirectoryURL: Foundation.URL, attachments: [AttachmentForExport], displayName: String = "") {
         if attachments.count <= 0 {
             return
         }
@@ -286,13 +332,18 @@ class XCPParser {
         progressBar.update(step: 0, total: attachments.count, text: "")
 
         for (index, attachment) in attachments.enumerated() {
-            progressBar.update(step: index, total: attachments.count, text: "Extracting \"\(attachment.filename ?? "Unknown Filename")\"")
+            progressBar.update(step: index, total: attachments.count, text: "Extracting \"\(attachment.attachment.filename ?? "Unknown Filename")\"")
 
-            XCResultToolCommand.Export(withXCResult: xcresult, attachment: attachment, outputPath: screenshotDirectoryURL.path).run()
+            XCResultToolCommand.Export(withXCResult: xcresult, attachment: attachment.attachment, outputPath: screenshotDirectoryURL.path).run()
         }
-
+        
         progressBar.update(step: attachments.count, total: attachments.count, text: "🎊 Export complete! 🎊")
         progressBar.complete(success: true)
+    }
+    
+    private func exportAttachmentDescriptors(for attachments: [AttachmentForExport], toDirectory directoryURL: Foundation.URL) throws {
+        let data = try JSONEncoder().encode(attachments.map { try $0.descriptor() })
+        try data.write(to: directoryURL.appendingPathComponent("xcparseAttachmentDescriptors.json"))
     }
     
     func extractCoverage(xcresultPath : String, destination : String) throws {
